@@ -61,7 +61,7 @@ app.post('/api/loans/:id/payment', (req, res) => {
     amount: req.body?.amount || 500,
     headers: JSON.stringify(req.headers),
     loanSnapshot: JSON.parse(JSON.stringify(loan)),
-    padding: 'X'.repeat(10000), // 10KB padding per entry — accelerates OOM
+    padding: 'X'.repeat(500000), // 500KB padding per entry — accelerates OOM
     requestId: `PAY-${Date.now()}-${Math.random().toString(36).slice(2)}`,
   };
   paymentAuditLog.push(auditEntry);
@@ -72,7 +72,7 @@ app.post('/api/loans/:id/payment', (req, res) => {
   console.log(`[PAYMENT] Loan ${loan.id} | audit entries: ${logCount} | heap: ${memMB}MB`);
 
   // When memory pressure is high, start failing
-  if (process.memoryUsage().heapUsed > 800 * 1024 * 1024) {
+  if (process.memoryUsage().heapUsed > 150 * 1024 * 1024) {
     console.error(`[ERROR] Payment processing failed — heap ${memMB}MB exceeds threshold`);
     console.error(`[ERROR] paymentAuditLog has ${logCount} entries consuming excessive memory`);
     return res.status(500).json({
