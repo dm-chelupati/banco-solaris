@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Banco Solaris — Empréstimos</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Segoe UI', Tahoma, sans-serif; background: #F5F5F5; color: #333; }
+
+  /* Header */
+  .header {
+    background: linear-gradient(135deg, #005CA9, #003D73);
+    color: white; padding: 20px 40px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .header h1 { font-size: 28px; font-weight: 700; }
+  .header .logo { display: flex; align-items: center; gap: 12px; }
+  .header .logo .sun {
+    width: 40px; height: 40px; background: #F37021;
+    border-radius: 50%; position: relative;
+  }
+  .header .logo .sun::after {
+    content: ''; position: absolute; top: 8px; left: 8px;
+    width: 24px; height: 24px; background: #FFD700;
+    border-radius: 50%;
+  }
+  .header .nav { display: flex; gap: 24px; font-size: 14px; }
+  .header .nav a { color: rgba(255,255,255,0.8); text-decoration: none; }
+  .header .nav a:hover { color: white; }
+
+  /* Stats bar */
+  .stats-bar {
+    background: white; padding: 20px 40px;
+    display: flex; gap: 40px; border-bottom: 3px solid #F37021;
+  }
+  .stat { text-align: center; }
+  .stat .value { font-size: 28px; font-weight: 700; color: #005CA9; }
+  .stat .label { font-size: 12px; color: #666; text-transform: uppercase; margin-top: 4px; }
+
+  /* Main */
+  .main { max-width: 1200px; margin: 30px auto; padding: 0 20px; }
+  .main h2 { color: #005CA9; font-size: 22px; margin-bottom: 16px; }
+
+  /* Table */
+  table { width: 100%; border-collapse: collapse; background: white; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }
+  thead { background: #005CA9; color: white; }
+  th { padding: 14px 16px; text-align: left; font-size: 13px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+  td { padding: 14px 16px; border-bottom: 1px solid #EEE; font-size: 14px; }
+  tr:hover { background: #F0F7FF; }
+  tr:last-child td { border-bottom: none; }
+
+  .status { padding: 4px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+  .status.active { background: #E8F5E9; color: #2E7D32; }
+  .status.overdue { background: #FFF3E0; color: #E65100; }
+  .status.paid { background: #E3F2FD; color: #1565C0; }
+
+  .btn { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600; transition: all 0.2s; }
+  .btn-pay { background: #F37021; color: white; }
+  .btn-pay:hover { background: #D4601A; }
+  .btn-pay:disabled { background: #CCC; cursor: not-allowed; }
+
+  /* Alert banner */
+  .alert { background: #FFF3E0; border-left: 4px solid #F37021; padding: 12px 20px; margin-bottom: 20px; border-radius: 0 6px 6px 0; display: none; }
+  .alert.error { background: #FFEBEE; border-left-color: #D32F2F; }
+  .alert.show { display: block; }
+
+  /* Footer */
+  .footer { text-align: center; padding: 20px; color: #999; font-size: 12px; margin-top: 40px; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">
+    <div class="sun"></div>
+    <h1>Banco Solaris</h1>
+  </div>
+  <div class="nav">
+    <a href="#">Início</a>
+    <a href="#">Empréstimos</a>
+    <a href="#">Pagamentos</a>
+    <a href="#">Suporte</a>
+  </div>
+</div>
+
+<div class="stats-bar">
+  <div class="stat"><div class="value" id="total-loans">—</div><div class="label">Total Empréstimos</div></div>
+  <div class="stat"><div class="value" id="active-loans">—</div><div class="label">Ativos</div></div>
+  <div class="stat"><div class="value" id="overdue-loans">—</div><div class="label">Em Atraso</div></div>
+  <div class="stat"><div class="value" id="total-outstanding">—</div><div class="label">Saldo Devedor</div></div>
+</div>
+
+<div class="main">
+  <div class="alert" id="alert"></div>
+
+  <h2>Empréstimos em Aberto</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Cliente</th>
+        <th>Tipo</th>
+        <th>Saldo Devedor</th>
+        <th>Taxa (%a.m.)</th>
+        <th>Status</th>
+        <th>Próx. Pagamento</th>
+        <th>Ação</th>
+      </tr>
+    </thead>
+    <tbody id="loans-table"></tbody>
+  </table>
+</div>
+
+<div class="footer">
+  Banco Solaris S.A. — CNPJ: 00.000.000/0001-00 — Ouvidoria: 0800 123 4567<br>
+  Este é um ambiente de demonstração. Nenhum dado real é utilizado.
+</div>
+
+<script>
+const fmt = (v) => 'R$ ' + v.toLocaleString('pt-BR', { minimumFractionDigits: 2 });
+
+async function loadLoans() {
+  try {
+    const res = await fetch('/api/loans');
+    const data = await res.json();
+    const tbody = document.getElementById('loans-table');
+    tbody.innerHTML = '';
+    data.loans.forEach(loan => {
+      const tr = document.createElement('tr');
+      const statusClass = loan.status === 'overdue' ? 'overdue' : loan.status === 'paid' ? 'paid' : 'active';
+      const statusLabel = loan.status === 'active' ? 'Ativo' : loan.status === 'overdue' ? 'Em Atraso' : 'Quitado';
+      const canPay = loan.status !== 'paid';
+      tr.innerHTML = `
+        <td><strong>${loan.customer}</strong></td>
+        <td>${loan.type}</td>
+        <td>${fmt(loan.outstanding)}</td>
+        <td>—</td>
+        <td><span class="status ${statusClass}">${statusLabel}</span></td>
+        <td>${loan.nextPayment || '—'}</td>
+        <td>${canPay ? `<button class="btn btn-pay" onclick="makePayment(${loan.id})">Pagar</button>` : '—'}</td>
+      `;
+      tbody.appendChild(tr);
+    });
+
+    // Stats
+    const stats = await (await fetch('/api/stats')).json();
+    document.getElementById('total-loans').textContent = stats.totalLoans;
+    document.getElementById('active-loans').textContent = stats.activeLoans;
+    document.getElementById('overdue-loans').textContent = stats.overdueLoans;
+    document.getElementById('total-outstanding').textContent = fmt(stats.totalOutstanding);
+  } catch (e) {
+    showAlert('Erro ao carregar empréstimos: ' + e.message, true);
+  }
+}
+
+async function makePayment(loanId) {
+  try {
+    const res = await fetch(`/api/loans/${loanId}/payment`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ amount: 500 })
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      showAlert(`Erro no pagamento: ${data.message || data.error}`, true);
+      return;
+    }
+    showAlert(`Pagamento de R$ 500,00 processado! Saldo restante: ${fmt(data.remaining)}`, false);
+    loadLoans();
+  } catch (e) {
+    showAlert('Falha na conexão: ' + e.message, true);
+  }
+}
+
+function showAlert(msg, isError) {
+  const el = document.getElementById('alert');
+  el.textContent = msg;
+  el.className = 'alert show' + (isError ? ' error' : '');
+  setTimeout(() => el.className = 'alert', 5000);
+}
+
+loadLoans();
+</script>
+</body>
+</html>
