@@ -18,9 +18,11 @@ const loans = [
   { id: 8, customer: 'Pedro Rocha', cpf: '***.***.***-45', type: 'Crédito Consignado', amount: 12000, outstanding: 0, rate: 1.29, term: 24, status: 'paid', nextPayment: null },
 ];
 
-// ── Payment processing state ──
-let breakPayments = process.env.BREAK_PAYMENTS === 'true';
-let paymentRequestCount = 0;
+// ── Payment transaction log — BUG: grows unbounded, never cleaned up ──
+// This is an intentional memory leak for SRE Agent investigation demo.
+// Every payment attempt stores the full request + response payload with
+// no eviction policy. Under load, this exhausts container memory → OOM → 500s.
+const paymentAuditLog = [];
 
 // ── Health check ──
 app.get('/health', (req, res) => {
@@ -43,21 +45,40 @@ app.get('/api/loans/:id', (req, res) => {
   res.json(loan);
 });
 
-// ── POST /api/loans/:id/payment — injectable 500 ──
+// ── POST /api/loans/:id/payment ──
+// BUG: Each payment stores a large audit entry in memory with no cleanup.
+// The audit log includes duplicated loan data, full headers, and a 10KB
+// padding string per entry. At ~200 requests this fills 1Gi container memory.
 app.post('/api/loans/:id/payment', (req, res) => {
-  paymentRequestCount++;
   const loan = loans.find(l => l.id === parseInt(req.params.id));
   if (!loan) return res.status(404).json({ error: 'Empréstimo não encontrado' });
 
-  if (breakPayments) {
-    // Simulate database connection failure
-    console.error(`[ERROR] Payment processing failed for loan ${loan.id} - Database connection timeout after 30000ms`);
-    console.error(`[ERROR] ConnectionPool exhausted: 0/10 connections available`);
-    console.error(`[ERROR] PostgreSQL host payment-db.internal:5432 unreachable`);
+  // Store bloated audit entry — this is the memory leak
+  const auditEntry = {
+    timestamp: new Date().toISOString(),
+    loanId: loan.id,
+    customer: loan.customer,
+    amount: req.body?.amount || 500,
+    headers: JSON.stringify(req.headers),
+    loanSnapshot: JSON.parse(JSON.stringify(loan)),
+    padding: 'X'.repeat(10000), // 10KB padding per entry — accelerates OOM
+    requestId: `PAY-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+  };
+  paymentAuditLog.push(auditEntry);
+
+  // Log memory usage (visible in container logs)
+  const memMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
+  const logCount = paymentAuditLog.length;
+  console.log(`[PAYMENT] Loan ${loan.id} | audit entries: ${logCount} | heap: ${memMB}MB`);
+
+  // When memory pressure is high, start failing
+  if (process.memoryUsage().heapUsed > 800 * 1024 * 1024) {
+    console.error(`[ERROR] Payment processing failed — heap ${memMB}MB exceeds threshold`);
+    console.error(`[ERROR] paymentAuditLog has ${logCount} entries consuming excessive memory`);
     return res.status(500).json({
       error: 'Internal Server Error',
-      message: 'Payment processing failed: Database connection timeout',
-      code: 'DB_CONNECTION_TIMEOUT',
+      message: 'Payment processing failed: out of memory',
+      code: 'OOM_AUDIT_LOG',
       timestamp: new Date().toISOString()
     });
   }
@@ -68,30 +89,16 @@ app.post('/api/loans/:id/payment', (req, res) => {
   res.json({ success: true, loan_id: loan.id, payment: amount, remaining: loan.outstanding });
 });
 
-// ── POST /api/break — activate break mode ──
-app.post('/api/break', (req, res) => {
-  breakPayments = true;
-  console.log('[BREAK] Payment processing break mode ACTIVATED');
-  res.json({ status: 'break_activated', message: 'Payment endpoint will return 500 errors' });
-});
-
-// ── POST /api/fix — deactivate break mode ──
-app.post('/api/fix', (req, res) => {
-  breakPayments = false;
-  paymentRequestCount = 0;
-  console.log('[FIX] Payment processing break mode DEACTIVATED');
-  res.json({ status: 'fixed', message: 'Payment endpoint restored' });
-});
-
 // ── GET /api/stats ──
 app.get('/api/stats', (req, res) => {
+  const memMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
   res.json({
     totalLoans: loans.length,
     activeLoans: loans.filter(l => l.status === 'active').length,
     overdueLoans: loans.filter(l => l.status === 'overdue').length,
     totalOutstanding: loans.reduce((s, l) => s + l.outstanding, 0),
-    paymentRequestCount,
-    breakMode: breakPayments
+    auditLogEntries: paymentAuditLog.length,
+    heapUsedMB: parseFloat(memMB)
   });
 });
 
