@@ -61,7 +61,7 @@ app.post('/api/loans/:id/payment', (req, res) => {
     amount: req.body?.amount || 500,
     headers: JSON.stringify(req.headers),
     loanSnapshot: JSON.parse(JSON.stringify(loan)),
-    padding: 'X'.repeat(500000), // 500KB padding per entry — accelerates OOM
+    padding: Buffer.alloc(500000, Math.random().toString(36)).toString(), // 500KB unique padding — cannot be interned
     requestId: `PAY-${Date.now()}-${Math.random().toString(36).slice(2)}`,
   };
   paymentAuditLog.push(auditEntry);
