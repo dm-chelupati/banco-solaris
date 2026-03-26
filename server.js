@@ -18,11 +18,36 @@ const loans = [
   { id: 8, customer: 'Pedro Rocha', cpf: '***.***.***-45', type: 'Crédito Consignado', amount: 12000, outstanding: 0, rate: 1.29, term: 24, status: 'paid', nextPayment: null },
 ];
 
-// ── Payment transaction log — BUG: grows unbounded, never cleaned up ──
-// This is an intentional memory leak for SRE Agent investigation demo.
-// Every payment attempt stores the full request + response payload with
-// no eviction policy. Under load, this exhausts container memory → OOM → 500s.
-const paymentAuditLog = [];
+// ── Payment Gateway Simulator ──
+// BUG: The gateway has a hardcoded 3-second timeout, but the payment validation
+// function has an exponential backoff retry that takes longer and longer.
+// After several rapid payments, the cumulative delay exceeds the timeout → 500.
+// The root cause is in validatePayment(): it uses a shared counter that never
+// resets, causing delay = paymentCount * 200ms. At 15+ payments, delay > 3000ms.
+let paymentCount = 0;
+const GATEWAY_TIMEOUT_MS = 3000;
+
+function validatePayment(loanId, amount) {
+  return new Promise((resolve, reject) => {
+    paymentCount++;
+    // BUG: delay grows with every payment — simulates a connection pool leak
+    // in the payment gateway client. Each payment adds 200ms because the
+    // gateway client doesn't release connections properly.
+    const delayMs = paymentCount * 200;
+    console.log(`[GATEWAY] Payment #${paymentCount} for loan ${loanId}: validation delay ${delayMs}ms (timeout: ${GATEWAY_TIMEOUT_MS}ms)`);
+
+    if (delayMs > GATEWAY_TIMEOUT_MS) {
+      console.error(`[ERROR] Payment gateway timeout: validation took ${delayMs}ms > ${GATEWAY_TIMEOUT_MS}ms limit`);
+      console.error(`[ERROR] paymentCount=${paymentCount}, gateway connections not released`);
+      reject(new Error(`Payment gateway timeout after ${GATEWAY_TIMEOUT_MS}ms — gateway connection pool exhausted (${paymentCount} unreleased connections)`));
+      return;
+    }
+
+    setTimeout(() => {
+      resolve({ transactionId: `TXN-${Date.now()}`, status: 'approved' });
+    }, delayMs);
+  });
+}
 
 // ── Health check ──
 app.get('/health', (req, res) => {
@@ -46,59 +71,41 @@ app.get('/api/loans/:id', (req, res) => {
 });
 
 // ── POST /api/loans/:id/payment ──
-// BUG: Each payment stores a large audit entry in memory with no cleanup.
-// The audit log includes duplicated loan data, full headers, and a 10KB
-// padding string per entry. At ~200 requests this fills 1Gi container memory.
-app.post('/api/loans/:id/payment', (req, res) => {
+app.post('/api/loans/:id/payment', async (req, res) => {
   const loan = loans.find(l => l.id === parseInt(req.params.id));
   if (!loan) return res.status(404).json({ error: 'Empréstimo não encontrado' });
 
-  // Store bloated audit entry — this is the memory leak
-  const auditEntry = {
-    timestamp: new Date().toISOString(),
-    loanId: loan.id,
-    customer: loan.customer,
-    amount: req.body?.amount || 500,
-    headers: JSON.stringify(req.headers),
-    loanSnapshot: JSON.parse(JSON.stringify(loan)),
-    padding: Buffer.alloc(500000, Math.random().toString(36)).toString(), // 500KB unique padding — cannot be interned
-    requestId: `PAY-${Date.now()}-${Math.random().toString(36).slice(2)}`,
-  };
-  paymentAuditLog.push(auditEntry);
-
-  // Log memory usage (visible in container logs)
-  const memMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
-  const logCount = paymentAuditLog.length;
-  console.log(`[PAYMENT] Loan ${loan.id} | audit entries: ${logCount} | heap: ${memMB}MB`);
-
-  // When memory pressure is high, start failing
-  if (process.memoryUsage().heapUsed > 150 * 1024 * 1024) {
-    console.error(`[ERROR] Payment processing failed — heap ${memMB}MB exceeds threshold`);
-    console.error(`[ERROR] paymentAuditLog has ${logCount} entries consuming excessive memory`);
-    return res.status(500).json({
+  try {
+    const gatewayResult = await validatePayment(loan.id, req.body?.amount || 500);
+    const amount = req.body?.amount || 500;
+    loan.outstanding = Math.max(0, loan.outstanding - amount);
+    if (loan.outstanding === 0) loan.status = 'paid';
+    res.json({
+      success: true, loan_id: loan.id, payment: amount,
+      remaining: loan.outstanding, transactionId: gatewayResult.transactionId
+    });
+  } catch (err) {
+    console.error(`[ERROR] Payment failed for loan ${loan.id}: ${err.message}`);
+    res.status(500).json({
       error: 'Internal Server Error',
-      message: 'Payment processing failed: out of memory',
-      code: 'OOM_AUDIT_LOG',
+      message: err.message,
+      code: 'GATEWAY_TIMEOUT',
       timestamp: new Date().toISOString()
     });
   }
-
-  const amount = req.body?.amount || 500;
-  loan.outstanding = Math.max(0, loan.outstanding - amount);
-  if (loan.outstanding === 0) loan.status = 'paid';
-  res.json({ success: true, loan_id: loan.id, payment: amount, remaining: loan.outstanding });
 });
 
 // ── GET /api/stats ──
 app.get('/api/stats', (req, res) => {
-  const memMB = (process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1);
   res.json({
     totalLoans: loans.length,
     activeLoans: loans.filter(l => l.status === 'active').length,
     overdueLoans: loans.filter(l => l.status === 'overdue').length,
     totalOutstanding: loans.reduce((s, l) => s + l.outstanding, 0),
-    auditLogEntries: paymentAuditLog.length,
-    heapUsedMB: parseFloat(memMB)
+    paymentCount,
+    currentDelayMs: paymentCount * 200,
+    gatewayTimeoutMs: GATEWAY_TIMEOUT_MS,
+    willTimeout: (paymentCount * 200) > GATEWAY_TIMEOUT_MS
   });
 });
 
