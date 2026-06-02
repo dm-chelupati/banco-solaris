@@ -19,33 +19,42 @@ const loans = [
 ];
 
 // ── Payment Gateway Simulator ──
-// BUG: The gateway has a hardcoded 3-second timeout, but the payment validation
-// function has an exponential backoff retry that takes longer and longer.
-// After several rapid payments, the cumulative delay exceeds the timeout → 500.
-// The root cause is in validatePayment(): it uses a shared counter that never
-// resets, causing delay = paymentCount * 200ms. At 15+ payments, delay > 3000ms.
-let paymentCount = 0;
+// FIX: Uses a concurrent connection counter that properly acquires/releases
+// connections. Each payment acquires a connection (incrementing activeConnections)
+// and releases it after validation completes (decrementing activeConnections).
+// The delay is based only on currently active concurrent connections, not
+// cumulative lifetime payments. This prevents unbounded growth.
+let activeConnections = 0;
+let totalPaymentCount = 0;
 const GATEWAY_TIMEOUT_MS = 3000;
+const MAX_CONCURRENT_CONNECTIONS = 15;
 
 function validatePayment(loanId, amount) {
   return new Promise((resolve, reject) => {
-    paymentCount++;
-    // BUG: delay grows with every payment — simulates a connection pool leak
-    // in the payment gateway client. Each payment adds 200ms because the
-    // gateway client doesn't release connections properly.
-    const delayMs = paymentCount * 200;
-    console.log(`[GATEWAY] Payment #${paymentCount} for loan ${loanId}: validation delay ${delayMs}ms (timeout: ${GATEWAY_TIMEOUT_MS}ms)`);
+    totalPaymentCount++;
+    activeConnections++;
+    const currentDelay = activeConnections * 200;
+    console.log(`[GATEWAY] Payment #${totalPaymentCount} for loan ${loanId}: ${activeConnections} active connections, delay ${currentDelay}ms (timeout: ${GATEWAY_TIMEOUT_MS}ms)`);
 
-    if (delayMs > GATEWAY_TIMEOUT_MS) {
-      console.error(`[ERROR] Payment gateway timeout: validation took ${delayMs}ms > ${GATEWAY_TIMEOUT_MS}ms limit`);
-      console.error(`[ERROR] paymentCount=${paymentCount}, gateway connections not released`);
-      reject(new Error(`Payment gateway timeout after ${GATEWAY_TIMEOUT_MS}ms — gateway connection pool exhausted (${paymentCount} unreleased connections)`));
+    if (activeConnections > MAX_CONCURRENT_CONNECTIONS) {
+      activeConnections--;
+      console.error(`[ERROR] Payment gateway: max concurrent connections (${MAX_CONCURRENT_CONNECTIONS}) exceeded`);
+      reject(new Error(`Payment gateway connection pool exhausted — ${MAX_CONCURRENT_CONNECTIONS} max concurrent connections`));
+      return;
+    }
+
+    if (currentDelay > GATEWAY_TIMEOUT_MS) {
+      activeConnections--;
+      console.error(`[ERROR] Payment gateway timeout: delay ${currentDelay}ms > ${GATEWAY_TIMEOUT_MS}ms limit`);
+      reject(new Error(`Payment gateway timeout after ${GATEWAY_TIMEOUT_MS}ms — too many concurrent requests`));
       return;
     }
 
     setTimeout(() => {
+      activeConnections--; // Release connection after validation completes
+      console.log(`[GATEWAY] Payment #${totalPaymentCount} for loan ${loanId}: connection released, ${activeConnections} active`);
       resolve({ transactionId: `TXN-${Date.now()}`, status: 'approved' });
-    }, delayMs);
+    }, currentDelay);
   });
 }
 
@@ -102,10 +111,12 @@ app.get('/api/stats', (req, res) => {
     activeLoans: loans.filter(l => l.status === 'active').length,
     overdueLoans: loans.filter(l => l.status === 'overdue').length,
     totalOutstanding: loans.reduce((s, l) => s + l.outstanding, 0),
-    paymentCount,
-    currentDelayMs: paymentCount * 200,
+    totalPaymentCount,
+    activeConnections,
+    maxConcurrentConnections: MAX_CONCURRENT_CONNECTIONS,
+    currentDelayMs: activeConnections * 200,
     gatewayTimeoutMs: GATEWAY_TIMEOUT_MS,
-    willTimeout: (paymentCount * 200) > GATEWAY_TIMEOUT_MS
+    willTimeout: (activeConnections * 200) > GATEWAY_TIMEOUT_MS
   });
 });
 
